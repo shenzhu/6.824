@@ -92,9 +92,6 @@ type Raft struct {
 	// logs
 	log []LogEntry
 
-	// last heart beat time
-	lastHeartBeatTime time.Time
-
 	// state of current Raft
 	state int
 
@@ -329,12 +326,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
-	}
-
-	DPrintf("Raft %d resetting election timer", rf.me)
+	// another Raft node became leader, update self state to follower and reset election timer
+	rf.currentTerm = args.Term
+	rf.votedFor = -1
 	rf.state = FOLLOWER
 	rf.electionTimer.Reset(rf.GetElectionTimeout())
 
@@ -529,7 +523,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.lastHeartBeatTime = time.Now()
 	rf.state = FOLLOWER
 	rf.log = []LogEntry{}
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm})
