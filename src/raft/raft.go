@@ -439,6 +439,7 @@ func (rf *Raft) ticker() {
 				// update state to prepare for election
 				rf.currentTerm += 1
 				rf.state = CANDIDATE
+				rf.votedFor = rf.me
 
 				args := RequestVoteArgs{
 					Term:         rf.currentTerm,
