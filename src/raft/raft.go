@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"fmt"
 	"math"
 	"math/rand"
@@ -28,6 +29,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -152,6 +154,16 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -174,6 +186,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var savedCurrentTerm int
+	var savedVotedFor int
+	var savedLog []LogEntry
+	if d.Decode(&savedCurrentTerm) != nil || d.Decode(&savedVotedFor) != nil || d.Decode(&savedLog) != nil {
+		DPrintf("Raft %d failed to read data from persisted state", rf.me)
+	} else {
+		rf.currentTerm = savedCurrentTerm
+		rf.votedFor = savedVotedFor
+		rf.log = savedLog
+	}
 }
 
 //
@@ -264,7 +290,11 @@ func (rf *Raft) sendHeartbeat(peer int, term int, leaderId int, prevLogIndex int
 	if rf.nextIndex[peer] >= len(rf.log) {
 		args.Entries = make([]LogEntry, 0)
 	} else {
-		args.Entries = []LogEntry{rf.log[rf.nextIndex[peer]]}
+		// we cannnot use rf.commitIndex as upper bound here, consider the case when leader just received
+		// a message and it wants to replicate that to other servers, but now since rf.commitIndex is 0,
+		// it cannot send anything
+		// so we don't use upper bound, just send all entries
+		args.Entries = rf.log[rf.nextIndex[peer]:]
 	}
 	rf.mu.Unlock()
 
@@ -281,6 +311,7 @@ func (rf *Raft) sendHeartbeat(peer int, term int, leaderId int, prevLogIndex int
 			rf.currentTerm = reply.Term
 			rf.state = FOLLOWER
 			rf.votedFor = -1
+			rf.persist()
 			return
 		}
 
@@ -307,7 +338,12 @@ func (rf *Raft) sendHeartbeat(peer int, term int, leaderId int, prevLogIndex int
 				}
 			} else {
 				DPrintf("Raft %d successfully replicated log to %d", rf.me, peer)
-				rf.nextIndex[peer] += len(args.Entries)
+				// cannot use rf.nextIndex[peer] += len(args.Entries)
+				// the reason is that when updating the variables, we must make sure the values we are using
+				// stays the same when sending the request and receiving the request
+				// so it's safe to use values in the request(args) since it won't change, however, rf.nextInt
+				// doesn't have this property
+				rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
 				rf.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
 			}
 		}
@@ -365,6 +401,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = FOLLOWER
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	currLastLogTerm := rf.log[len(rf.log)-1].Term
@@ -381,6 +418,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.electionTimer.Reset(rf.GetElectionTimeout())
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
+	rf.persist()
 }
 
 //
@@ -458,6 +496,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	rf.votedFor = -1
 	rf.state = FOLLOWER
+	rf.persist()
 	rf.electionTimer.Reset(rf.GetElectionTimeout())
 
 	// reply false if log doesn't contain an entry at prevLogIndex matching prevLogTerm
@@ -505,6 +544,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if i != len(args.Entries) {
 		rf.log = append(rf.log, args.Entries[i:]...)
 	}
+	rf.persist()
 
 	DPrintf("Raft %d updated its log to: %v", rf.me, rf.log)
 
@@ -594,6 +634,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// append entry to local log
 	newLogEntry := LogEntry{Term: term, Command: command}
 	rf.log = append(rf.log, newLogEntry)
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -662,6 +703,7 @@ func (rf *Raft) ticker() {
 				rf.currentTerm += 1
 				rf.state = CANDIDATE
 				rf.votedFor = rf.me
+				rf.persist()
 
 				args := RequestVoteArgs{
 					Term:         rf.currentTerm,
@@ -712,6 +754,7 @@ func (rf *Raft) ticker() {
 									rf.state = FOLLOWER
 									rf.currentTerm = reply.Term
 									rf.votedFor = -1
+									rf.persist()
 								}
 							}
 							rf.mu.Unlock()
@@ -733,8 +776,6 @@ func (rf *Raft) ticker() {
 
 					go rf.sendHeartbeat(peer, rf.currentTerm, rf.me, rf.nextIndex[peer]-1, rf.log[rf.nextIndex[peer]-1].Term, rf.commitIndex)
 				}
-				// batchSize := len(rf.log) - 1 - rf.commitIndex
-				// go rf.sendHeartbeat(rf.currentTerm, rf.me, len(rf.log)-1-batchSize, rf.log[len(rf.log)-1-batchSize].Term, rf.commitIndex)
 				rf.heartbeatTimer.Reset(rf.GetHeartbeatTimeout())
 			}
 			rf.mu.Unlock()
