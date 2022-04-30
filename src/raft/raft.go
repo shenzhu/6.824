@@ -179,6 +179,22 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(data)
 }
 
+func (rf *Raft) getLogAtIndex(index int) *LogEntry {
+	if index < rf.log[0].Index {
+		return nil
+	}
+	adjustedIndex := index - rf.log[0].Index
+	if len(rf.log) <= adjustedIndex {
+		return nil
+	}
+
+	return &rf.log[adjustedIndex]
+}
+
+func (rf *Raft) GetStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
 //
 // restore previously persisted state.
 //
@@ -262,7 +278,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	}
 
 	rf.log = rf.log[index-prevSnapshotIndex:]
-	rf.log[0].Command = nil
 
 	DPrintf("Raft %d applied Snapshot up to %d, setting base index to %d, length %d", rf.me, index, rf.log[0].Index, len(rf.log))
 	rf.persister.SaveStateAndSnapshot(rf.serializeState(), snapshot)
@@ -622,7 +637,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-	if rf.log[args.PrevLogIndex-baseIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= baseIndex && rf.log[args.PrevLogIndex-baseIndex].Term != args.PrevLogTerm {
 		DPrintf("Raft %d rejected AppendEntries because term %d does not match with %d", rf.me, rf.log[args.PrevLogIndex-baseIndex].Term, args.PrevLogTerm)
 		reply.ConflictTerm = rf.log[args.PrevLogIndex-baseIndex].Term
 		j := args.PrevLogIndex - 1
@@ -637,14 +652,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if len(args.Entries) != 0 {
-		for i, entry := range args.Entries {
-			if entry.Index-baseIndex >= len(rf.log) || entry.Term != rf.log[entry.Index-baseIndex].Term {
-				rf.log = rf.log[:entry.Index-baseIndex]
-				for j := i; j < len(args.Entries); j++ {
-					rf.log = append(rf.log, args.Entries[j])
+		if args.Entries[len(args.Entries)-1].Index >= rf.log[0].Index {
+			left := 0
+			for i, entry := range args.Entries {
+				currLog := rf.getLogAtIndex(entry.Index)
+				if currLog != nil {
+					if currLog.Term != entry.Term {
+						rf.log = rf.log[:entry.Index-rf.log[0].Index]
+						left = i
+						break
+					}
+
+					left = i + 1
 				}
-				// rf.log = append(rf.log[:entry.Index-baseIndex], args.Entries[i:]...)
-				break
+			}
+
+			for i := left; i < len(args.Entries); i++ {
+				entry := args.Entries[i]
+				rf.log = append(rf.log, entry)
 			}
 		}
 		DPrintf("Raft %d updated its log to: %v", rf.me, rf.log)
@@ -825,6 +850,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	newLogEntry := LogEntry{Term: term, Command: command, Index: index}
 	rf.log = append(rf.log, newLogEntry)
 	rf.persist()
+
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+		go rf.sync(peer)
+	}
 
 	return index, term, isLeader
 }
